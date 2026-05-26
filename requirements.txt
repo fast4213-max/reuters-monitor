@@ -1,0 +1,5 @@
+# Reuters Japan モニター 依存パッケージ
+# Python 3.12 以上を推奨
+
+# HTTP リクエスト（RSS 取得・Discord Webhook 送信）
+requests==2.32.3
