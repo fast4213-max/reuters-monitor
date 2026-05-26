@@ -35,11 +35,12 @@ MAX_NOTIFY = 10
 PENDING_FILE = Path("data/pending.json")
 
 # Google News RSS URL
-# allinurl:jp.reuters.com で jp.reuters.com の記事のみに絞り込み
-# 中東関連キーワードを AND 検索で追加
+# site:jp.reuters.com でロイター記事に絞り込み
+# 中東関連キーワードを OR 検索で幅広く拾う
 RSS_URL = (
     "https://news.google.com/rss/search"
-    "?q=allinurl:jp.reuters.com+中東"
+    "?q=site:jp.reuters.com+"
+    "(中東+OR+イスラエル+OR+ガザ+OR+パレスチナ+OR+イラン+OR+レバノン)"
     "&hl=ja&gl=JP&ceid=JP:ja"
 )
 
