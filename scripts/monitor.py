@@ -18,7 +18,7 @@ import os
 import sys
 import time
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
@@ -27,6 +27,8 @@ import requests
 # ─────────────────────────────────────────────
 # 定数・設定
 # ─────────────────────────────────────────────
+
+JST = timezone(timedelta(hours=9))
 
 # 1回の実行で Discord に送信する最大件数
 MAX_NOTIFY = 10
@@ -213,12 +215,25 @@ def save_pending(articles: list[dict]) -> None:
 # 差分検知
 # ─────────────────────────────────────────────
 
+def _is_today_jst(published_at_iso: str) -> bool:
+    """
+    published_at（UTC ISO 8601）がJSTで「今日」かどうかを返す。
+    パース失敗時は安全側（False）を返す。
+    """
+    try:
+        dt = datetime.fromisoformat(published_at_iso).astimezone(JST)
+        return dt.date() == datetime.now(JST).date()
+    except Exception:
+        logger.warning("日付判定失敗（スキップ）: %s", published_at_iso)
+        return False
+
+
 def extract_new_articles(
     fetched: list[dict],
     pending: list[dict],
 ) -> list[dict]:
     """
-    取得した記事のうち、未通知リストに存在しない新着記事を返す。
+    取得した記事のうち、未通知リストに存在せず、かつ本日（JST）の記事のみを返す。
     重複判定は記事の id（GUID）で行う。
 
     Args:
@@ -229,8 +244,12 @@ def extract_new_articles(
         新着記事リスト（古い順）
     """
     existing_ids = {article["id"] for article in pending}
-    new_articles = [a for a in fetched if a["id"] not in existing_ids]
-    logger.info("新着記事: %d 件", len(new_articles))
+    new_articles = [
+        a for a in fetched
+        if a["id"] not in existing_ids
+        and _is_today_jst(a["published_at"])
+    ]
+    logger.info("新着記事（本日JST）: %d 件", len(new_articles))
     return new_articles
 
 
@@ -315,9 +334,7 @@ def _format_datetime(iso_str: str) -> str:
     """ISO 8601 文字列を '2025-01-15 12:34 UTC' 形式に変換する。"""
     try:
         dt = datetime.fromisoformat(iso_str)
-        from datetime import timezone, timedelta
-        jst = timezone(timedelta(hours=9))
-        return dt.astimezone(jst).strftime("%Y-%m-%d %H:%M JST")
+        return dt.astimezone(JST).strftime("%Y-%m-%d %H:%M JST")
     except Exception:
         return iso_str
 
