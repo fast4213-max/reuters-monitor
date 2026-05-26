@@ -56,10 +56,14 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%SZ",
+    datefmt="%Y-%m-%d %H:%M:%S JST",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-logging.Formatter.converter = time.gmtime
+# ログ時刻を JST（UTC+9）で表示する
+# time.gmtime にオフセット9時間を加算して struct_time を返す（logging互換）
+def _to_jst(*args):
+    return time.gmtime(time.time() + 9 * 3600)
+logging.Formatter.converter = _to_jst
 logger = logging.getLogger(__name__)
 
 
@@ -311,7 +315,9 @@ def _format_datetime(iso_str: str) -> str:
     """ISO 8601 文字列を '2025-01-15 12:34 UTC' 形式に変換する。"""
     try:
         dt = datetime.fromisoformat(iso_str)
-        return dt.strftime("%Y-%m-%d %H:%M UTC")
+        from datetime import timezone, timedelta
+        jst = timezone(timedelta(hours=9))
+        return dt.astimezone(jst).strftime("%Y-%m-%d %H:%M JST")
     except Exception:
         return iso_str
 
