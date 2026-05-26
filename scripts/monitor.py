@@ -311,6 +311,10 @@ def send_discord_notifications(articles: list[dict], session: requests.Session) 
         try:
             _post_embed(article, session)
             sent.append(article)
+        except RateLimitedError:
+            # レート制限時はこの記事以降をすべて次回に持ち越す（待機しない）
+            logger.warning("レート制限のため送信を中断: 残り %d 件は次回実行時に送信", len(articles) - i + 1)
+            break
         except Exception as e:
             logger.error("Discord 送信失敗（スキップ）: %s | 記事: %s", e, article["title"])
             continue
@@ -319,10 +323,14 @@ def send_discord_notifications(articles: list[dict], session: requests.Session) 
     return sent
 
 
+class RateLimitedError(Exception):
+    """Discord 429 レート制限を示す例外。次回実行まで持ち越す。"""
+
+
 def _post_embed(article: dict, session: requests.Session) -> None:
     """
     1件の記事を Discord Embed 形式で送信する。
-    429（レート制限）時は Retry-After 秒待機して1回リトライする。
+    429（レート制限）時は RateLimitedError を送出し、待機やリトライは行わない。
     それ以外の HTTP エラー時は例外を送出する。
     """
     published_display = _format_datetime(article["published_at"])
@@ -350,10 +358,9 @@ def _post_embed(article: dict, session: requests.Session) -> None:
     response = session.post(DISCORD_WEBHOOK_URL, json=payload, timeout=15)
 
     if response.status_code == 429:
-        retry_after = float(response.headers.get("Retry-After", 1))
-        logger.warning("Discord レート制限: %s 秒待機してリトライ", retry_after)
-        time.sleep(retry_after)
-        response = session.post(DISCORD_WEBHOOK_URL, json=payload, timeout=15)
+        retry_after = response.headers.get("Retry-After", "不明")
+        logger.warning("Discord レート制限: Retry-After=%s 秒 → 残りを次回に持ち越し", retry_after)
+        raise RateLimitedError(f"Retry-After={retry_after}")
 
     response.raise_for_status()
 
@@ -377,7 +384,7 @@ def main() -> None:
       1. RSS 取得（リダイレクト URL を解決）
       2. 未通知リスト読み込み
       3. 差分検知（過去24h以内 & 重複排除）→ pending.json に追記
-      4. 最大 MAX_NOTIFY 件を Discord 通知（429リトライあり）
+      4. 最大 MAX_NOTIFY 件を Discord 通知（429時は即中断・次回持ち越し）
       5. 送信済みを pending.json から削除・保存（上限 MAX_PENDING 件）
     """
     logger.info("=== Reuters Japan 中東モニター 開始 ===")
@@ -434,3 +441,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
