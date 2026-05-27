@@ -478,7 +478,7 @@ def main() -> None:
 
         sent_ids           = {a["id"] for a in sent_articles}
         unsent_from_batch  = [a for a in to_notify if a["id"] not in sent_ids]
-        updated_pending    = unsent_from_batch + remaining
+        updated_pending    = sorted(unsent_from_batch + remaining, key=lambda a: a["published_at"])  # 常に古い順
 
         save_sent(sent)
         save_pending(updated_pending)
@@ -491,4 +491,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
