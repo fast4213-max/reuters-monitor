@@ -13,70 +13,56 @@
 name: Reuters Japan Middle East Monitor
 
 on:
-  # cron-job.org から POST されるトリガー
   repository_dispatch:
     types:
       - run-reuters-monitor
-
-  # GitHub Actions UI からの手動実行（テスト用）
   workflow_dispatch:
 
-# 同時実行を防止する（重複通知・競合書き込みの回避）
 concurrency:
   group: reuters-monitor
-  cancel-in-progress: false   # 実行中の場合は後発をキューイング（破棄しない）
+  cancel-in-progress: false
 
 jobs:
   monitor:
     name: Fetch & Notify
     runs-on: ubuntu-latest
-    # タイムアウト: 10分（RSS取得・Discord送信込み）
     timeout-minutes: 10
 
-    # ワークフローがリポジトリへの書き込み権限を持つように設定
     permissions:
       contents: write
 
     steps:
-      # ── 1. リポジトリをチェックアウト ──────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          # git push 時に使用するトークン（デフォルトで GITHUB_TOKEN を使用）
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── 2. Python 環境をセットアップ ───────────────────────────
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: "pip"
 
-      # ── 3. 依存パッケージをインストール ────────────────────────
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # ── 4. モニタースクリプトを実行 ────────────────────────────
       - name: Run monitor script
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: python scripts/monitor.py
 
-      # ── 5. pending.json をリポジトリにコミット・プッシュ ────────
-      #    `git status --porcelain` で変更有無を判定してスキップ制御する。
-      #    [skip ci] タグにより、このコミット自体が Actions を再起動しないようにする。
-      - name: Commit and push pending.json
+      # pending.json と sent.json を両方コミット
+      - name: Commit and push data files
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add data/pending.json
+          git add data/pending.json data/sent.json
 
-          # ステージングに差分がなければスキップ（新着なし・変化なしの場合）
           if git diff --cached --quiet; then
-            echo "pending.json に変更なし。コミットをスキップします。"
+            echo "変更なし。コミットをスキップします。"
             exit 0
           fi
 
-          git commit -m "chore: update pending.json [skip ci]"
+          git commit -m "chore: update pending.json / sent.json [skip ci]"
           git push
