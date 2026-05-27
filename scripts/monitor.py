@@ -452,6 +452,7 @@ def main() -> None:
 
         if new_articles:
             pending.extend(new_articles)
+            pending.sort(key=lambda a: a["published_at"])  # 古い順に並べ直す
             logger.info("pending 合計: %d 件（新着 %d 件 追加後）", len(pending), len(new_articles))
         else:
             logger.info("新着記事なし")
@@ -490,3 +491,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
