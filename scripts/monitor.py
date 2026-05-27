@@ -2,15 +2,19 @@
 Reuters Japan 中東情勢モニター
 ================================
 Google News RSS から jp.reuters.com の中東関連記事を取得し、
-未通知リスト（JSON）と差分比較して Discord に通知する。
+送信済みリスト・未通知リストと差分比較して Discord に通知する。
 
 フロー:
-  1. Google News RSS を取得・パース
-  2. Google News リダイレクト URL を最終 URL に解決
-  3. 未通知リスト（data/pending.json）と比較して新着記事を抽出（過去24時間以内）
+  1. Google News RSS を取得・パース（URL は raw のまま保持）
+  2. 送信済みリスト（data/sent.json）と未通知リスト（data/pending.json）を読み込み
+  3. 新着記事を抽出（過去24時間以内 & 両リストに未登録）
   4. 新着記事を pending.json に追加（古い順）、上限 MAX_PENDING 件でトリム
-  5. pending.json の先頭から最大 MAX_NOTIFY 件を Discord へ送信
-  6. 送信済み記事を pending.json から削除して保存
+  5. pending.json の先頭から最大 MAX_NOTIFY 件を Discord へ送信（直前にURL解決）
+  6. 送信済み記事を sent.json に記録、pending.json から削除して保存
+
+ファイル役割:
+  pending.json … 未送信キュー（送信後は削除される）
+  sent.json    … 送信済み記事 ID の記録（重複通知防止、7日分保持）
 """
 
 import json
@@ -40,12 +44,16 @@ MAX_PENDING = 500
 # 新着記事として扱う最大経過時間（時間）
 RECENT_HOURS = 24
 
-# 未通知記事を保存するファイルパス（リポジトリルートからの相対パス）
+# sent.json の保持期間（日）：これより古い送信済み記録は自動削除
+SENT_RETENTION_DAYS = 7
+
+# 未通知記事を保存するファイルパス
 PENDING_FILE = Path("data/pending.json")
 
+# 送信済み記事IDを記録するファイルパス
+SENT_FILE = Path("data/sent.json")
+
 # Google News RSS URL
-# site:jp.reuters.com でロイター記事に絞り込み
-# 中東関連キーワードを OR 検索で幅広く拾う
 RSS_URL = (
     "https://news.google.com/rss/search"
     "?q=site:jp.reuters.com+"
@@ -57,7 +65,7 @@ RSS_URL = (
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
 # ─────────────────────────────────────────────
-# ロガー設定（GitHub Actions コンソールに出力）
+# ロガー設定
 # ─────────────────────────────────────────────
 
 logging.basicConfig(
@@ -66,9 +74,10 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S JST",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-# ログ時刻を JST（UTC+9）で表示する
+
 def _to_jst(*args):
     return time.gmtime(time.time() + 9 * 3600)
+
 logging.Formatter.converter = _to_jst
 logger = logging.getLogger(__name__)
 
@@ -80,14 +89,10 @@ logger = logging.getLogger(__name__)
 def fetch_rss_articles(session: requests.Session) -> list[dict]:
     """
     Google News RSS を取得し、記事リストを返す。
-    Google News のリダイレクト URL は resolve_final_url() で最終 URL に解決する。
+    URL はリダイレクト解決せず raw のまま返す（解決は送信直前に行う）。
 
     Returns:
-        list[dict]: 記事辞書のリスト。各記事は以下のキーを持つ。
-            - id           (str): 記事を一意に識別する GUID または URL
-            - title        (str): 記事タイトル
-            - url          (str): 最終リダイレクト先の記事 URL
-            - published_at (str): ISO 8601 形式の公開日時（UTC）
+        list[dict]: 各記事は id / title / url（raw） / published_at を持つ。
     """
     logger.info("RSS フィードを取得中: %s", RSS_URL)
 
@@ -119,14 +124,8 @@ def fetch_rss_articles(session: requests.Session) -> list[dict]:
             raw_url      = _get_text(item, "link")
             guid         = _get_text(item, "guid") or raw_url
             pub_date_raw = _get_text(item, "pubDate")
-
-            # 公開日時を UTC の ISO 8601 文字列に統一
             published_at = _parse_pub_date(pub_date_raw)
 
-            # ── ソース判定 ────────────────────────────────────────────
-            # Google News RSS の <link> はリダイレクト URL になる場合がある。
-            # そのため URL ではなく <source> タグのドメインで Reuters を判定する。
-            # <source url="https://jp.reuters.com">ロイター</source>
             source_node = item.find("source")
             source_url  = (source_node.get("url") or "") if source_node is not None else ""
             source_text = (source_node.text or "").strip() if source_node is not None else ""
@@ -141,13 +140,10 @@ def fetch_rss_articles(session: requests.Session) -> list[dict]:
                 logger.debug("スキップ（Reuters 以外）: source_url=%s title=%s", source_url, title)
                 continue
 
-            # Google News リダイレクト URL を最終 URL に解決する
-            resolved_url = resolve_final_url(session, raw_url)
-
             articles.append({
                 "id":           guid,
                 "title":        title,
-                "url":          resolved_url,
+                "url":          raw_url,   # raw URL のまま保持（解決は送信直前）
                 "published_at": published_at,
             })
 
@@ -155,7 +151,6 @@ def fetch_rss_articles(session: requests.Session) -> list[dict]:
             logger.warning("記事パース中にエラー（スキップ）: %s", e)
             continue
 
-    # 古い順（時系列昇順）にソート
     articles.sort(key=lambda a: a["published_at"])
     logger.info("jp.reuters.com の記事: %d 件", len(articles))
     return articles
@@ -165,6 +160,7 @@ def resolve_final_url(session: requests.Session, url: str) -> str:
     """
     リダイレクトを追って最終 URL を返す。
     失敗した場合は元の URL をそのまま返す。
+    Discord 送信直前に1件ずつ呼び出す。
     """
     try:
         r = session.get(url, timeout=10, allow_redirects=True, headers={
@@ -177,16 +173,11 @@ def resolve_final_url(session: requests.Session, url: str) -> str:
 
 
 def _get_text(element: ET.Element, tag: str) -> str:
-    """指定タグのテキストを返す。存在しない場合は空文字。"""
     node = element.find(tag)
     return (node.text or "").strip() if node is not None else ""
 
 
 def _parse_pub_date(pub_date_raw: str) -> str:
-    """
-    RFC 2822 形式の日付文字列を UTC の ISO 8601 文字列に変換する。
-    パース失敗時は現在時刻を返す。
-    """
     if not pub_date_raw:
         return datetime.now(timezone.utc).isoformat()
     try:
@@ -195,6 +186,63 @@ def _parse_pub_date(pub_date_raw: str) -> str:
     except Exception:
         logger.warning("日付パース失敗: %s → 現在時刻を使用", pub_date_raw)
         return datetime.now(timezone.utc).isoformat()
+
+
+# ─────────────────────────────────────────────
+# 送信済みリスト（sent.json）
+# ─────────────────────────────────────────────
+
+def load_sent() -> dict[str, str]:
+    """
+    送信済みリストを読み込む。
+    戻り値: {記事ID: 送信日時(ISO)} の辞書。
+    ファイルが存在しない場合は空辞書を返す。
+    """
+    if not SENT_FILE.exists():
+        return {}
+    try:
+        with SENT_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        logger.info("sent.json を読み込み: %d 件", len(data))
+        return data
+    except (json.JSONDecodeError, OSError) as e:
+        logger.error("sent.json 読み込み失敗（空辞書で継続）: %s", e)
+        return {}
+
+
+def save_sent(sent: dict[str, str]) -> None:
+    """
+    送信済みリストを保存する。
+    SENT_RETENTION_DAYS 日より古いエントリは自動削除する。
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=SENT_RETENTION_DAYS)
+
+    # 古いエントリを削除
+    before = len(sent)
+    sent = {
+        k: v for k, v in sent.items()
+        if _parse_iso_safe(v) > cutoff
+    }
+    removed = before - len(sent)
+    if removed:
+        logger.info("sent.json: %d 日超えの古いエントリ %d 件を削除", SENT_RETENTION_DAYS, removed)
+
+    SENT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with SENT_FILE.open("w", encoding="utf-8") as f:
+            json.dump(sent, f, ensure_ascii=False, indent=2)
+        logger.info("sent.json を保存: %d 件", len(sent))
+    except OSError as e:
+        logger.exception("sent.json 保存失敗: %s", e)
+        raise
+
+
+def _parse_iso_safe(iso_str: str) -> datetime:
+    """ISO 8601 文字列を datetime に変換する。失敗時は epoch を返す。"""
+    try:
+        return datetime.fromisoformat(iso_str)
+    except Exception:
+        return datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 # ─────────────────────────────────────────────
@@ -223,9 +271,7 @@ def save_pending(articles: list[dict]) -> None:
     """
     未通知リストをファイルに保存する。
     MAX_PENDING 件を超える場合は古い順に切り捨てる。
-    ディレクトリが存在しない場合は作成する。
     """
-    # 肥大化防止: 末尾 MAX_PENDING 件のみ保持（新しい記事を優先）
     if len(articles) > MAX_PENDING:
         logger.warning("pending が上限超過（%d件）→ 古い %d 件を破棄", len(articles), len(articles) - MAX_PENDING)
         articles = articles[-MAX_PENDING:]
@@ -245,11 +291,7 @@ def save_pending(articles: list[dict]) -> None:
 # ─────────────────────────────────────────────
 
 def _is_recent(published_at_iso: str, hours: int = RECENT_HOURS) -> bool:
-    """
-    published_at（UTC ISO 8601）が現在時刻から指定時間以内かどうかを返す。
-    GitHub Actions が停止しても RECENT_HOURS 以内の記事は取りこぼさない。
-    パース失敗時は安全側（False）を返す。
-    """
+    """published_at が現在時刻から指定時間以内かどうかを返す。"""
     try:
         dt = datetime.fromisoformat(published_at_iso)
         return dt > datetime.now(timezone.utc) - timedelta(hours=hours)
@@ -261,27 +303,35 @@ def _is_recent(published_at_iso: str, hours: int = RECENT_HOURS) -> bool:
 def extract_new_articles(
     fetched: list[dict],
     pending: list[dict],
+    sent: dict[str, str],
 ) -> list[dict]:
     """
-    取得した記事のうち、未通知リストに存在せず、かつ過去 RECENT_HOURS 時間以内の記事を返す。
-    重複判定は id（GUID）と url の両方で行う。
+    取得した記事のうち、以下をすべて満たすものを返す:
+      - 過去 RECENT_HOURS 時間以内に公開
+      - pending.json（未送信キュー）に未登録
+      - sent.json（送信済み記録）に未登録
 
     Args:
         fetched: RSS から取得した全記事
-        pending: 現在の未通知リスト
+        pending: 未送信キュー
+        sent:    送信済み記録 {id: 送信日時}
 
     Returns:
         新着記事リスト（古い順）
     """
-    # id と url の両方が一致する場合のみ既知とみなす（GUID が変わるケースに対応）
-    existing_keys = {(a["id"], a["url"]) for a in pending}
+    pending_ids = {a["id"] for a in pending}
+    sent_ids    = set(sent.keys())
+    known_ids   = pending_ids | sent_ids
 
     new_articles = [
         a for a in fetched
-        if (a["id"], a["url"]) not in existing_keys
+        if a["id"] not in known_ids
         and _is_recent(a["published_at"])
     ]
-    logger.info("新着記事（過去%dh以内）: %d 件", RECENT_HOURS, len(new_articles))
+    logger.info(
+        "新着記事（過去%dh以内）: %d 件  ／  既知: pending=%d sent=%d",
+        RECENT_HOURS, len(new_articles), len(pending_ids), len(sent_ids)
+    )
     return new_articles
 
 
@@ -289,14 +339,14 @@ def extract_new_articles(
 # Discord 通知
 # ─────────────────────────────────────────────
 
+class RateLimitedError(Exception):
+    """Discord 429 レート制限を示す例外。次回実行まで持ち越す。"""
+
+
 def send_discord_notifications(articles: list[dict], session: requests.Session) -> list[dict]:
     """
     Discord に Embed 形式で通知を送信する。
-    送信成功した記事のリストを返す。
-
-    Args:
-        articles: 通知対象の記事リスト（最大 MAX_NOTIFY 件）
-        session:  共有 requests.Session
+    429 時は即中断し、残りを次回に持ち越す。
 
     Returns:
         送信成功した記事のリスト
@@ -312,7 +362,6 @@ def send_discord_notifications(articles: list[dict], session: requests.Session) 
             _post_embed(article, session)
             sent.append(article)
         except RateLimitedError:
-            # レート制限時はこの記事以降をすべて次回に持ち越す（待機しない）
             logger.warning("レート制限のため送信を中断: 残り %d 件は次回実行時に送信", len(articles) - i + 1)
             break
         except Exception as e:
@@ -323,31 +372,29 @@ def send_discord_notifications(articles: list[dict], session: requests.Session) 
     return sent
 
 
-class RateLimitedError(Exception):
-    """Discord 429 レート制限を示す例外。次回実行まで持ち越す。"""
-
-
 def _post_embed(article: dict, session: requests.Session) -> None:
     """
     1件の記事を Discord Embed 形式で送信する。
-    429（レート制限）時は RateLimitedError を送出し、待機やリトライは行わない。
-    それ以外の HTTP エラー時は例外を送出する。
+    送信直前にリダイレクト URL を解決する。
+    429 時は RateLimitedError を送出（待機・リトライなし）。
     """
+    # URL解決は送信直前に1件ずつ（fetch時にまとめて解決しない）
+    resolved_url      = resolve_final_url(session, article["url"])
     published_display = _format_datetime(article["published_at"])
 
     payload = {
         "embeds": [
             {
-                "title": article["title"][:256],  # Discord の title 上限
-                "url":   article["url"],
-                "color": 0xE63329,                # ロイターブランドカラー（赤）
+                "title": article["title"][:256],
+                "url":   resolved_url,
+                "color": 0xE63329,
                 "footer": {
                     "text": f"ロイター通信 Japan ｜ {published_display}"
                 },
                 "fields": [
                     {
                         "name":   "🔗 記事を読む",
-                        "value":  article["url"],
+                        "value":  resolved_url,
                         "inline": False,
                     }
                 ],
@@ -366,7 +413,6 @@ def _post_embed(article: dict, session: requests.Session) -> None:
 
 
 def _format_datetime(iso_str: str) -> str:
-    """ISO 8601 文字列を '2025-01-15 12:34 JST' 形式に変換する。"""
     try:
         dt = datetime.fromisoformat(iso_str)
         return dt.astimezone(JST).strftime("%Y-%m-%d %H:%M JST")
@@ -381,11 +427,11 @@ def _format_datetime(iso_str: str) -> str:
 def main() -> None:
     """
     メイン処理フロー:
-      1. RSS 取得（リダイレクト URL を解決）
-      2. 未通知リスト読み込み
-      3. 差分検知（過去24h以内 & 重複排除）→ pending.json に追記
-      4. 最大 MAX_NOTIFY 件を Discord 通知（429時は即中断・次回持ち越し）
-      5. 送信済みを pending.json から削除・保存（上限 MAX_PENDING 件）
+      1. RSS 取得（URL は raw のまま）
+      2. sent.json / pending.json 読み込み
+      3. 差分検知（過去24h & 両リスト未登録）→ pending.json に追記
+      4. 最大 MAX_NOTIFY 件を Discord 通知（送信直前にURL解決、429時は即中断）
+      5. 送信済みを sent.json に記録、pending.json から削除・保存
     """
     logger.info("=== Reuters Japan 中東モニター 開始 ===")
 
@@ -397,11 +443,12 @@ def main() -> None:
             logger.critical("RSS 取得に失敗したため処理を中断: %s", e)
             sys.exit(1)
 
-        # ── Step 2: 未通知リスト読み込み ──────────
+        # ── Step 2: リスト読み込み ─────────────────
+        sent    = load_sent()
         pending = load_pending()
 
         # ── Step 3: 差分検知・追記 ────────────────
-        new_articles = extract_new_articles(fetched_articles, pending)
+        new_articles = extract_new_articles(fetched_articles, pending, sent)
 
         if new_articles:
             pending.extend(new_articles)
@@ -416,29 +463,30 @@ def main() -> None:
             return
 
         to_notify = pending[:MAX_NOTIFY]
-        remaining = pending[MAX_NOTIFY:]  # 11件目以降は次回に持ち越し
+        remaining = pending[MAX_NOTIFY:]
 
         if remaining:
-            logger.info(
-                "送信対象: %d 件 ／ 次回繰越: %d 件",
-                len(to_notify), len(remaining)
-            )
+            logger.info("送信対象: %d 件 ／ 次回繰越: %d 件", len(to_notify), len(remaining))
 
         sent_articles = send_discord_notifications(to_notify, session)
 
-        # ── Step 5: 送信済みを pending から削除・保存 ──
-        sent_ids = {a["id"] for a in sent_articles}
-        unsent_from_batch = [a for a in to_notify if a["id"] not in sent_ids]
-        updated_pending = unsent_from_batch + remaining
+        # ── Step 5: 送信済みを記録・pending から削除 ──
+        now_iso = datetime.now(timezone.utc).isoformat()
+        for a in sent_articles:
+            sent[a["id"]] = now_iso
 
+        sent_ids           = {a["id"] for a in sent_articles}
+        unsent_from_batch  = [a for a in to_notify if a["id"] not in sent_ids]
+        updated_pending    = unsent_from_batch + remaining
+
+        save_sent(sent)
         save_pending(updated_pending)
 
     logger.info(
-        "=== 処理完了: 送信=%d件 / 残=%d件 ===",
-        len(sent_articles), len(updated_pending)
+        "=== 処理完了: 送信=%d件 / pending残=%d件 / sent累計=%d件 ===",
+        len(sent_articles), len(updated_pending), len(sent)
     )
 
 
 if __name__ == "__main__":
     main()
-
